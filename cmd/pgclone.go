@@ -651,13 +651,18 @@ func main() {
 	}()
 
 	// Loop through tables
+	failed := false
 	for _, table := range tables {
 		infoLog.Printf("🚀 Starting transfer of table: %s.%s", *schema, table)
 		err := CopyTableInBatches(ctx, srcDB, dstDB, *schema, table, *batchSize)
 		if err != nil {
 			infoLog.Printf("❌ Error copying table %s.%s: %v", *schema, table, err)
+			failed = true
 			continue
 		}
 		infoLog.Printf("✅ Completed transfer of table: %s.%s\n", *schema, table)
+	}
+	if failed {
+		os.Exit(1)
 	}
 }
