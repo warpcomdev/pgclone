@@ -76,8 +76,8 @@ pipeline {
         )
         string(
             name: 'INSTALL_URL',
-            defaultValue: 'https://raw.githubusercontent.com/warpcomdev/pgclone/main/hacks/install.sh',
-            description: 'Raw GitHub URL of the install script.'
+            defaultValue: 'https://github.com/warpcomdev/pgclone/releases/latest/download/install.sh',
+            description: 'GitHub release URL of the generated install script.'
         )
         string(
             name: 'INSTALLATION_PATH',
@@ -99,11 +99,14 @@ pipeline {
             steps {
                 script {
                     def installDir = "${WORKSPACE}/${params.INSTALLATION_PATH}"
+                    def installer = "${installDir}/install.sh"
                     echo "Installing pgclone to ${installDir}"
                     sh """
                         set -e
                         mkdir -p "${installDir}"
-                        INSTALLATION_PATH="${installDir}" curl -fsSL "${params.INSTALL_URL}" | sh
+                        curl -fsSL "${params.INSTALL_URL}" -o "${installer}"
+                        INSTALLATION_PATH="${installDir}" sh "${installer}"
+                        rm -f "${installer}"
                     """
                     sh "\"${installDir}/pgclone\" -help || true"
                 }

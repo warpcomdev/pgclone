@@ -24,7 +24,9 @@
 The fastest way to install the latest release on Linux (`amd64`) is:
 
 ```sh
-curl -fsSL "https://raw.githubusercontent.com/warpcomdev/pgclone/main/hacks/install.sh" | sh
+curl -fsSLO "https://github.com/warpcomdev/pgclone/releases/latest/download/install.sh"
+sh install.sh
+rm install.sh
 ```
 
 This downloads the release archive, verifies its checksum, and installs `pgclone` into `/usr/local/bin`.
@@ -32,7 +34,9 @@ This downloads the release archive, verifies its checksum, and installs `pgclone
 To install somewhere else:
 
 ```sh
-INSTALLATION_PATH="$HOME/.local/bin" curl -fsSL "https://raw.githubusercontent.com/warpcomdev/pgclone/main/hacks/install.sh" | sh
+curl -fsSLO "https://github.com/warpcomdev/pgclone/releases/latest/download/install.sh"
+INSTALLATION_PATH="$HOME/.local/bin" sh install.sh
+rm install.sh
 ```
 
 ### From source

@@ -10,10 +10,8 @@ version: 2
 
 before:
   hooks:
-    # You may remove this if you don't use go modules.
     - go mod tidy
-    # you may remove this if you don't need go generate
-    - go generate ./...
+    - ./hacks/render-install.sh {{ .Version }}
 
 builds:
   - main: ./...
@@ -37,6 +35,9 @@ changelog:
       - "^test:"
 
 release:
+  extra_files:
+    - glob: ./.release/install.sh
+      name_template: install.sh
   footer: >-
 
     ---

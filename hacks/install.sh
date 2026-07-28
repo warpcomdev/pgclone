@@ -5,7 +5,7 @@
 set -e
 
 REPO="warpcomdev/pgclone"
-VERSION="0.1.0"
+VERSION="__VERSION__"
 INSTALLATION_PATH="${INSTALLATION_PATH:-/usr/local/bin}"
 
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
