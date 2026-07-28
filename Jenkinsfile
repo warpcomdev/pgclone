@@ -1,12 +1,11 @@
 pipeline {
     agent {
-        label '${params.AGENT_LABEL}'
+        label "${params.AGENT_LABEL ?: 'DATAMIGRATION'}"
     }
 
     options {
-        buildDiscarder(logRotator(numToKeepStr: '30'))
+        buildDiscarder(logRotator(numToKeepStr: '200'))
         timestamps()
-        ansiColor('xterm')
     }
 
     parameters {
@@ -82,31 +81,39 @@ pipeline {
         )
         string(
             name: 'INSTALLATION_PATH',
-            defaultValue: "${WORKSPACE}/.local/bin",
-            description: 'Directory where pgclone will be installed for this build.'
+            defaultValue: '.local/bin',
+            description: 'Relative directory under WORKSPACE where pgclone will be installed for this build.'
         )
     }
 
-    environment {
-        PATH = "${params.INSTALLATION_PATH}:${env.PATH}"
-    }
-
     stages {
+        stage('Set custom build display name') {
+            steps {
+                script {
+                    currentBuild.displayName = "#${currentBuild.number} ${params.SCHEMA}.${params.TABLE}"
+                    currentBuild.description = "Copy table ${params.SCHEMA}.${params.TABLE} from source to target."
+                }
+            }
+        }
         stage('Install pgclone') {
             steps {
                 script {
-                    echo "Installing pgclone to ${params.INSTALLATION_PATH}"
+                    def installDir = "${WORKSPACE}/${params.INSTALLATION_PATH}"
+                    echo "Installing pgclone to ${installDir}"
                     sh """
                         set -e
-                        mkdir -p "${params.INSTALLATION_PATH}"
-                        INSTALLATION_PATH="${params.INSTALLATION_PATH}" curl -fsSL "${params.INSTALL_URL}" | sh
+                        mkdir -p "${installDir}"
+                        INSTALLATION_PATH="${installDir}" curl -fsSL "${params.INSTALL_URL}" | sh
                     """
-                    sh "\"${params.INSTALLATION_PATH}/pgclone\" -help || true"
+                    sh "\"${installDir}/pgclone\" -help || true"
                 }
             }
         }
 
         stage('Copy table') {
+            environment {
+                PATH = "${WORKSPACE}/${params.INSTALLATION_PATH}:${env.PATH}"
+            }
             steps {
                 script {
                     // Pull passwords from Jenkins Credentials.
@@ -115,6 +122,8 @@ pipeline {
                         string(credentialsId: 'DATAMIGRATION_SOURCE_DB_PASSWORD', variable: 'SOURCE_DB_PASSWORD'),
                         string(credentialsId: 'DATAMIGRATION_TARGET_DB_PASSWORD', variable: 'TARGET_DB_PASSWORD')
                     ]) {
+                        def installDir = "${WORKSPACE}/${params.INSTALLATION_PATH}"
+
                         // Build pgpass entries from DSNs so lib/pq can authenticate without putting
                         // passwords on the command line or in process listings.
                         // lib/pgpass format: hostname:port:database:username:password
@@ -136,20 +145,20 @@ ${extractPgpassLine(params.TARGET_DSN, env.TARGET_DB_PASSWORD)}
 
                         // Disable shell command echo to avoid printing the constructed command in logs.
                         sh """
-                            set +x
-                            export PGPASSFILE='${pgpassFile}'
-                            '${params.INSTALLATION_PATH}/pgclone' \\
-                                -source '${params.SOURCE_DSN}' \\
-                                -target '${params.TARGET_DSN}' \\
-                                -schema '${params.SCHEMA}' \\
-                                -batch-size ${params.BATCH_SIZE} \\
-                                -retries ${params.RETRIES} \\
-                                -mbps ${params.MBPS} \\
-                                -parallel ${params.PARALLEL} \\
-                                ${offsetFlag} \\
-                                ${skipChunkFlag} \\
-                                ${verboseFlag} \\
-                                ${updateFlag} \\
+                                set +x
+                                export PGPASSFILE='${pgpassFile}'
+                            '${installDir}/pgclone' \\
+                                    -source '${params.SOURCE_DSN}' \\
+                                    -target '${params.TARGET_DSN}' \\
+                                    -schema '${params.SCHEMA}' \\
+                                    -batch-size ${params.BATCH_SIZE} \\
+                                    -retries ${params.RETRIES} \\
+                                    -mbps ${params.MBPS} \\
+                                    -parallel ${params.PARALLEL} \\
+                                    ${offsetFlag} \\
+                                    ${skipChunkFlag} \\
+                                    ${verboseFlag} \\
+                                    ${updateFlag} \\
                                 ${tableArg}
                         """
                     }
@@ -161,8 +170,8 @@ ${extractPgpassLine(params.TARGET_DSN, env.TARGET_DB_PASSWORD)}
     post {
         always {
             script {
-                // Best-effort cleanup of the pgpass file
-                sh "rm -f ${WORKSPACE}/.pgpass || true"
+                // Best-effort cleanup of files that may contain connection details.
+                sh "rm -f ${WORKSPACE}/.pgpass ${WORKSPACE}/pgclone.log || true"
             }
         }
         failure {
@@ -195,5 +204,5 @@ String extractPgpassLine(String dsn, String password) {
 
 String shellEscape(String arg) {
     // Escape single quotes for safe shell inclusion
-    return arg.replace("'", '"'"'"'"')
+    return arg.replace("'", '"')
 }
