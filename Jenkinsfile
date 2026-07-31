@@ -141,7 +141,7 @@ pipeline {
                                 set +x
                                 umask 077
                                 escape_pgpass() {
-                                    printf '%s' "$1" | sed 's/\\/\\\\/g; s/:/\\:/g'
+                                    printf '%s' "$1" | sed 's|\\|\\\\|g; s|:|\\:|g'
                                 }
                                 {
                                     printf '%s' "$SOURCE_PGPASS_PREFIX"
