@@ -6,3 +6,5 @@ require (
 	github.com/lib/pq v1.12.3
 	golang.org/x/sync v0.22.0
 )
+
+require github.com/DATA-DOG/go-sqlmock v1.5.2

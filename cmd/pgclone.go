@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,12 +11,13 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -78,6 +80,9 @@ func getChunksForHypertable(db *sql.DB, schema, table string) ([]qualifiedTableN
 		}
 		chunks = append(chunks, chunk)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed while reading chunks: %w", err)
+	}
 	return chunks, nil
 }
 
@@ -90,6 +95,9 @@ func CopyTableInBatches(ctx context.Context, srcDB *sql.DB, dstDB chan *sql.DB, 
 	cols, err := getColumnNames(srcDB, schema, table)
 	if err != nil {
 		return fmt.Errorf("failed to get column names: %w", err)
+	}
+	if len(cols) == 0 {
+		return fmt.Errorf("source relation %s.%s does not exist, is not visible, or has no columns", schema, table)
 	}
 
 	maxWriteBatch := 65535 / len(cols)
@@ -104,7 +112,19 @@ func CopyTableInBatches(ctx context.Context, srcDB *sql.DB, dstDB chan *sql.DB, 
 		return fmt.Errorf("failed to get primary key columns: %w", err)
 	}
 	if len(pkCols) == 0 {
-		return fmt.Errorf("no primary key found on table %s.%s", schema, table)
+		return fmt.Errorf("table %s.%s has no primary key; stable keyset pagination requires one", schema, table)
+	}
+
+	var validationDB *sql.DB
+	select {
+	case <-ctx.Done():
+		return errInterrupted
+	case validationDB = <-dstDB:
+	}
+	err = validateTarget(ctx, validationDB, schema, table, cols)
+	dstDB <- validationDB
+	if err != nil {
+		return fmt.Errorf("target validation failed for %s.%s: %w", schema, table, err)
 	}
 
 	if len(pkCols) > 1 && update {
@@ -185,12 +205,12 @@ func CopyTableInBatches(ctx context.Context, srcDB *sql.DB, dstDB chan *sql.DB, 
 
 			// Run the query
 			var rows *sql.Rows
-			err = withRetry(func() error {
+			err = withRetry(ctx, func() error {
 				var innerErr error
 				if whereClause == "" {
-					rows, innerErr = srcDB.Query(query)
+					rows, innerErr = srcDB.QueryContext(ctx, query)
 				} else {
-					rows, innerErr = srcDB.Query(query, lastPK...)
+					rows, innerErr = srcDB.QueryContext(ctx, query, lastPK...)
 				}
 				return innerErr
 			})
@@ -213,6 +233,9 @@ func CopyTableInBatches(ctx context.Context, srcDB *sql.DB, dstDB chan *sql.DB, 
 				batch = append(batch, row)
 				// Rough size estimate: count string/[]byte lengths + constant for primitives
 				totalBitsRead += float64(estimateRowSize(row)) * 8
+			}
+			if err := rows.Err(); err != nil {
+				return nil, fmt.Errorf("row iteration failed: %w", err)
 			}
 
 			// If no rows collected, return io.EOF
@@ -237,7 +260,11 @@ func CopyTableInBatches(ctx context.Context, srcDB *sql.DB, dstDB chan *sql.DB, 
 				delay := time.Duration(float64(totalBitsRead)/(float64(maxMegabitsPerSec)*1e6))*time.Second - elapsed
 				if delay > 0 {
 					infoLog.Printf("Throttling: sleeping %s to stay under %.2f Mbps (current rate: %.2f Mbps)", delay.Round(time.Millisecond), maxMegabitsPerSec, bitsPerSec/1e6)
-					time.Sleep(delay)
+					select {
+					case <-ctx.Done():
+						return nil, errInterrupted
+					case <-time.After(delay):
+					}
 				}
 			}
 
@@ -315,7 +342,7 @@ func CopyTableInBatches(ctx context.Context, srcDB *sql.DB, dstDB chan *sql.DB, 
 						defer func() { dstDB <- db }()
 					}
 					// Insert always targets the hypertable even if we read from individual chunks.
-					if err := insertBatch(db, schema, table, cols, pkCols, subBatch); err != nil {
+					if err := insertBatch(innerCtx, db, schema, table, cols, pkCols, subBatch); err != nil {
 						return fmt.Errorf("failed to insert subbatch: %w", err)
 					}
 					return nil
@@ -423,6 +450,9 @@ func getColumnNames(db *sql.DB, schema, table string) ([]string, error) {
 		}
 		cols = append(cols, col)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return cols, nil
 }
 
@@ -451,7 +481,21 @@ func getPrimaryKeyColumns(db *sql.DB, schema, table string) ([]string, error) {
 		}
 		pkCols = append(pkCols, col)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return pkCols, nil
+}
+
+func validateTarget(ctx context.Context, db *sql.DB, schema, table string, cols []string) error {
+	query := fmt.Sprintf("SELECT %s FROM %s.%s LIMIT 0", strings.Join(cols, ", "), schema, table)
+	debugLog.Printf("Validating target with query: %s", query)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	return rows.Err()
 }
 
 func estimateRowCount(db *sql.DB, schema, table string) (int, error) {
@@ -492,7 +536,7 @@ func buildWhereClause(pkCols []string) string {
 	return "WHERE " + strings.Join(conditions, " OR ")
 }
 
-func insertBatch(db *sql.DB, schema, table string, cols, pkCols []string, batch [][]interface{}) error {
+func insertBatch(ctx context.Context, db *sql.DB, schema, table string, cols, pkCols []string, batch [][]interface{}) error {
 	colList := strings.Join(cols, ", ")
 	valPlaceholders := make([]string, len(batch))
 	args := make([]interface{}, 0, len(batch)*len(cols))
@@ -518,8 +562,8 @@ func insertBatch(db *sql.DB, schema, table string, cols, pkCols []string, batch 
 		schema, table, colList, strings.Join(valPlaceholders, ", "), conflictClause,
 	)
 
-	return withRetry(func() error {
-		if _, err := db.Exec(query, args...); err != nil {
+	return withRetry(ctx, func() error {
+		if _, err := db.ExecContext(ctx, query, args...); err != nil {
 			return err
 		}
 		return nil
@@ -539,7 +583,7 @@ func buildConflictClause(cols, pkCols []string) string {
 	)
 }
 
-func withRetry(action func() error) error {
+func withRetry(ctx context.Context, action func() error) error {
 	var err error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		err = action()
@@ -550,11 +594,18 @@ func withRetry(action func() error) error {
 		if !isTransientError(err) {
 			return err
 		}
+		if attempt == maxRetries {
+			break
+		}
 
 		wait := time.Duration(math.Pow(2, float64(attempt))) * time.Second
 		wait += time.Duration(rand.Intn(1000)) * time.Millisecond
-		infoLog.Printf("Transient error: %v. Retrying in %v (attempt %d/%d)...", err, wait, attempt+1, maxRetries)
-		time.Sleep(wait)
+		infoLog.Printf("Transient error: %v. Retrying in %v (retry %d/%d)...", err, wait, attempt+1, maxRetries)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
 	}
 	return fmt.Errorf("operation failed after %d retries: %w", maxRetries, err)
 }
@@ -563,12 +614,39 @@ func isTransientError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "connection") ||
-		strings.Contains(msg, "timeout") ||
-		strings.Contains(msg, "too many connections") ||
-		strings.Contains(msg, "temporarily unavailable") ||
-		strings.Contains(msg, "network")
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		code := string(pqErr.Code)
+		return strings.HasPrefix(code, "08") ||
+			code == "40001" ||
+			code == "40P01" ||
+			code == "53300" ||
+			code == "57P03"
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, driver.ErrBadConn) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+func validateOptions(batchSize int) error {
+	if batchSize <= 0 {
+		return errors.New("batch-size must be greater than zero")
+	}
+	if parallel <= 0 {
+		return errors.New("parallel must be greater than zero")
+	}
+	if maxRetries < 0 {
+		return errors.New("retries must not be negative")
+	}
+	if maxMegabitsPerSec <= 0 {
+		return errors.New("mbps must be greater than zero")
+	}
+	if offset < 0 {
+		return errors.New("offset must not be negative")
+	}
+	return nil
 }
 
 func indexOf(s string, list []string) int {
@@ -614,6 +692,9 @@ func main() {
 	if *sourceDSN == "" || *targetDSN == "" || len(tables) == 0 {
 		flag.Usage()
 		os.Exit(1)
+	}
+	if err := validateOptions(*batchSize); err != nil {
+		log.Fatalf("Invalid options: %v", err)
 	}
 
 	ctx, cancelFunc := context.WithCancel(context.Background())

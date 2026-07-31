@@ -133,6 +133,7 @@ With `-update` it tries to use `ON CONFLICT DO UPDATE SET`, overwriting existing
 
 - **Linux `amd64` only** for pre-built binaries. The installer supports only Linux on `x86_64`/`amd64`.
 - **Primary key required** on every table you copy.
+- **Target schema required** — the destination table and every copied source column must already exist.
 - **No config file** — all options are passed as flags.
 - **DSN credentials** are shown in process listings, so avoid passing passwords inline on shared machines; use `PGPASSFILE` or `.pgpass` via `lib/pq` instead.
 - **TimescaleDB chunk resume** is the only resumption mechanism; ordinary table copies currently resume only via `-offset`.

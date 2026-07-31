@@ -64,6 +64,8 @@ tar -xzf "$tmpdir/$asset" -C "$tmpdir"
 
 echo "Installing pgclone to ${INSTALLATION_PATH}..."
 mkdir -p "$INSTALLATION_PATH"
-install -m 755 "$tmpdir/cmd" "$INSTALLATION_PATH/pgclone"
+install_tmp="$INSTALLATION_PATH/.pgclone.tmp.$$"
+install -m 755 "$tmpdir/cmd" "$install_tmp"
+mv -f "$install_tmp" "$INSTALLATION_PATH/pgclone"
 
 echo "pgclone v${VERSION} installed to ${INSTALLATION_PATH}/pgclone"

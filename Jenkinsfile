@@ -98,7 +98,8 @@ pipeline {
         stage('Install pgclone') {
             steps {
                 script {
-                    def installDir = "${WORKSPACE}/${params.INSTALLATION_PATH}"
+                    def buildDir = "${WORKSPACE}/.pgclone-${env.BUILD_NUMBER}"
+                    def installDir = "${buildDir}/${params.INSTALLATION_PATH}"
                     def installer = "${installDir}/install.sh"
                     echo "Installing pgclone to ${installDir}"
                     sh """
@@ -114,9 +115,6 @@ pipeline {
         }
 
         stage('Copy table') {
-            environment {
-                PATH = "${WORKSPACE}/${params.INSTALLATION_PATH}:${env.PATH}"
-            }
             steps {
                 script {
                     // Pull passwords from Jenkins Credentials.
@@ -125,17 +123,35 @@ pipeline {
                         string(credentialsId: 'DATAMIGRATION_SOURCE_DB_PASSWORD', variable: 'SOURCE_DB_PASSWORD'),
                         string(credentialsId: 'DATAMIGRATION_TARGET_DB_PASSWORD', variable: 'TARGET_DB_PASSWORD')
                     ]) {
-                        def installDir = "${WORKSPACE}/${params.INSTALLATION_PATH}"
+                        def buildDir = "${WORKSPACE}/.pgclone-${env.BUILD_NUMBER}"
+                        def installDir = "${buildDir}/${params.INSTALLATION_PATH}"
+                        def pgcloneLog = "${buildDir}/pgclone.log"
+                        def pgcloneError = "${buildDir}/pgclone-error.txt"
 
                         // Build pgpass entries from DSNs so lib/pq can authenticate without putting
                         // passwords on the command line or in process listings.
                         // lib/pgpass format: hostname:port:database:username:password
-                        def pgpassFile = "${WORKSPACE}/.pgpass"
-
-                        writeFile file: pgpassFile, text: """${extractPgpassLine(params.SOURCE_DSN, env.SOURCE_DB_PASSWORD)}
-${extractPgpassLine(params.TARGET_DSN, env.TARGET_DB_PASSWORD)}
-"""
-                        sh "chmod 600 ${pgpassFile}"
+                        def pgpassFile = "${buildDir}/.pgpass"
+                        withEnv([
+                            "PGPASS_FILE=${pgpassFile}",
+                            "SOURCE_PGPASS_PREFIX=${extractPgpassPrefix(params.SOURCE_DSN)}",
+                            "TARGET_PGPASS_PREFIX=${extractPgpassPrefix(params.TARGET_DSN)}"
+                        ]) {
+                            sh '''
+                                set +x
+                                umask 077
+                                escape_pgpass() {
+                                    printf '%s' "$1" | sed 's/\\/\\\\/g; s/:/\\:/g'
+                                }
+                                {
+                                    printf '%s' "$SOURCE_PGPASS_PREFIX"
+                                    escape_pgpass "$SOURCE_DB_PASSWORD"
+                                    printf '\n%s' "$TARGET_PGPASS_PREFIX"
+                                    escape_pgpass "$TARGET_DB_PASSWORD"
+                                    printf '\n'
+                                } > "$PGPASS_FILE"
+                            '''
+                        }
 
                         // Build optional flags
                         def verboseFlag   = params.VERBOSE ? '-verbose' : ''
@@ -146,11 +162,12 @@ ${extractPgpassLine(params.TARGET_DSN, env.TARGET_DB_PASSWORD)}
 
                         echo "Starting pgclone for schema [${params.SCHEMA}] and table [${params.TABLE}]"
 
-                        // Disable shell command echo to avoid printing the constructed command in logs.
-                        sh """
+                        // Keep the full output as an artifact while preserving the process exit status.
+                        def pgcloneStatus = sh returnStatus: true, script: """
                                 set +x
+                                set +e
                                 export PGPASSFILE='${pgpassFile}'
-                            '${installDir}/pgclone' \\
+                                '${installDir}/pgclone' \\
                                     -source '${params.SOURCE_DSN}' \\
                                     -target '${params.TARGET_DSN}' \\
                                     -schema '${params.SCHEMA}' \\
@@ -162,8 +179,29 @@ ${extractPgpassLine(params.TARGET_DSN, env.TARGET_DB_PASSWORD)}
                                     ${skipChunkFlag} \\
                                     ${verboseFlag} \\
                                     ${updateFlag} \\
-                                ${tableArg}
+                                    ${tableArg} > '${pgcloneLog}' 2>&1
+                                status=\$?
+                                cat '${pgcloneLog}'
+                                if [ "\$status" -ne 0 ]; then
+                                    grep -E 'Error copying table|panic:|fatal error:|runtime error:' '${pgcloneLog}' \\
+                                        | tail -n 1 > '${pgcloneError}' || true
+                                    if [ ! -s '${pgcloneError}' ]; then
+                                        tail -n 20 '${pgcloneLog}' > '${pgcloneError}'
+                                    fi
+                                fi
+                                exit "\$status"
                         """
+
+                        if (pgcloneStatus != 0) {
+                            def errorSummary = fileExists(pgcloneError)
+                                ? readFile(pgcloneError).trim().replaceAll(/[\r\n]+/, ' ')
+                                : "pgclone exited with status ${pgcloneStatus}"
+                            if (errorSummary.length() > 500) {
+                                errorSummary = errorSummary.take(497) + '...'
+                            }
+                            currentBuild.description = "${params.SCHEMA}.${params.TABLE} failed: ${errorSummary}"
+                            error("pgclone failed with exit status ${pgcloneStatus}: ${errorSummary}")
+                        }
                     }
                 }
             }
@@ -173,8 +211,15 @@ ${extractPgpassLine(params.TARGET_DSN, env.TARGET_DB_PASSWORD)}
     post {
         always {
             script {
-                // Best-effort cleanup of files that may contain connection details.
-                sh "rm -f ${WORKSPACE}/.pgpass ${WORKSPACE}/pgclone.log || true"
+                try {
+                    archiveArtifacts(
+                        artifacts: ".pgclone-${env.BUILD_NUMBER}/pgclone.log,.pgclone-${env.BUILD_NUMBER}/pgclone-error.txt",
+                        allowEmptyArchive: true
+                    )
+                } finally {
+                    // Best-effort cleanup of files that may contain connection details.
+                    sh "rm -rf '${WORKSPACE}/.pgclone-${env.BUILD_NUMBER}' || true"
+                }
             }
         }
         failure {
@@ -191,7 +236,7 @@ ${extractPgpassLine(params.TARGET_DSN, env.TARGET_DB_PASSWORD)}
 // ---------------------------------------------------------------------------
 
 @NonCPS
-String extractPgpassLine(String dsn, String password) {
+String extractPgpassPrefix(String dsn) {
     // Minimal parser for postgres://user@host:port/db?...
     // lib/pgpass format: hostname:port:database:username:password
     def m = dsn =~ /^postgres(?:ql)?:\/\/([^:@]+)(?::[^@]+)?@([^:\/]+)(?::(\d+))?\/([^?]+)/
@@ -202,7 +247,7 @@ String extractPgpassLine(String dsn, String password) {
     def host = m[0][2]
     def port = m[0][3] ?: '5432'
     def database = m[0][4]
-    return "${host}:${port}:${database}:${user}:${password}"
+    return "${host}:${port}:${database}:${user}:"
 }
 
 String shellEscape(String arg) {
