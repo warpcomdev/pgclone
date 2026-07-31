@@ -141,7 +141,8 @@ pipeline {
                                 set +x
                                 umask 077
                                 escape_pgpass() {
-                                    printf '%s' "$1" | sed 's|\\|\\\\|g; s|:|\\:|g'
+                                    # Backslashes are doubled once for Groovy and once for sed.
+                                    printf '%s' "$1" | sed 's|\\\\|\\\\\\\\|g; s|:|\\\\:|g'
                                 }
                                 {
                                     printf '%s' "$SOURCE_PGPASS_PREFIX"
